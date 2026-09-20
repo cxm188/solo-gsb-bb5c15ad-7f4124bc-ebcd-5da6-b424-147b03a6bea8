@@ -21,6 +21,18 @@
 其余名额在保证全局可行的前提下以**最小费用最大流**求解，使相对上一轮的
 **新增 + 移除关系总数最少**，同成本解按 ID 顺序确定性破除。
 
+请求携带 `"balance_workload": true` 时进入**负载均衡模式**：完整可行解按字典序优化——
+先最小化所有 `capacity > 0` 评审人**最终负载率**（`分配数 / capacity`）的最大值，
+再最小化相对 `previous_assignments` 的新增 + 移除总数，最后按 ID 破同；
+负载率以**约分分数**表示与比较（不依赖浮点），响应返回最优最大负载率的约分分数
+与改动数；无完整解时沿用现有诊断，不输出部分分配。
+
+请求携带 `"balance_workload": true` 时进入**负载均衡模式**：完整可行解在资格、赛道、
+锁定与容量约束下按字典序优化——先最小化所有 `capacity > 0` 评审人**最终负载率**
+（`分配数 / capacity`）的最大值，再最小化相对 `previous_assignments` 的改动数，
+最后按 ID 破同；负载率全程以约分分数（整数分子/分母）表示与比较，**不依赖浮点数**，
+响应返回最优最大负载率的约分分数与改动数。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -96,6 +108,8 @@ docker run -p 8000:8000 review-assign
     评审人的映射中时，该评审人在此赛道上的分配数不得超过对应限额，且与总容量
     `capacity` 同时生效；未列入映射的赛道与不携带 `track` 的稿件只受总容量约束。
 - 稿件 / 评审人 `id` 必须各自唯一，否则返回 `422`。
+- `balance_workload`（可选，默认 `false`）：启用负载均衡优化，见下文
+  「负载均衡模式」。
 
 可行时响应（`200`）：
 
@@ -111,7 +125,8 @@ docker run -p 8000:8000 review-assign
   "unsatisfied": null,
   "shared_pool": null,
   "locked_conflicts": null,
-  "bottleneck_cut": null
+  "bottleneck_cut": null,
+  "balance": null
 }
 ```
 
@@ -156,7 +171,8 @@ docker run -p 8000:8000 review-assign
     ],
     "max_assignable": 2,
     "shortfall": 2
-  }
+  },
+  "balance": null
 }
 ```
 
@@ -278,7 +294,8 @@ docker run -p 8000:8000 review-assign
   "unsatisfied": null,
   "shared_pool": null,
   "locked_conflicts": null,
-  "bottleneck_cut": null
+  "bottleneck_cut": null,
+  "balance": null
 }
 ```
 
@@ -303,7 +320,8 @@ docker run -p 8000:8000 review-assign
       "detail": "评审人 r1 被锁定 3 篇稿件，超出其容量 2"
     }
   ],
-  "bottleneck_cut": null
+  "bottleneck_cut": null,
+  "balance": null
 }
 ```
 
@@ -363,7 +381,8 @@ docker run -p 8000:8000 review-assign
   "unsatisfied": null,
   "shared_pool": null,
   "locked_conflicts": null,
-  "bottleneck_cut": null
+  "bottleneck_cut": null,
+  "balance": null
 }
 ```
 
@@ -402,9 +421,62 @@ docker run -p 8000:8000 review-assign
       "detail": "评审人 r1 在赛道 poster 被锁定 2 篇稿件，超出其赛道限额 1"
     }
   ],
-  "bottleneck_cut": null
+  "bottleneck_cut": null,
+  "balance": null
 }
 ```
+
+### 负载均衡模式（可选）
+
+请求携带 `"balance_workload": true` 时启用负载均衡优化：完整可行解在资格、
+赛道、锁定与容量约束下按**字典序**依次优化——
+
+1. **最小化最大负载率**：所有 `capacity > 0` 的评审人中，最终负载率
+   `分配数 / capacity` 的最大值最小（锁定关系计入最终负载）；
+2. **最少改动**：在最大负载率已达最优的解中，相对 `previous_assignments` 的
+   新增 + 移除关系总数最小（`previous_assignments` 缺省时该级无区分作用，
+   改动数恒等于分配总数）；
+3. **ID 破同**：仍并列时按 ID 顺序确定性选取（与其他模式相同）。
+
+负载率的表示与比较全程使用**约分分数（整数分子/分母）**，不依赖浮点数：
+最优值必为某评审人 `最终负载 / capacity` 的分数（约分后分母不超过最大容量
+`max_cap`），求解器先在 `1/max_cap` 整数网格上二分，把最优值定位到宽度
+`1/max_cap` 的区间，再在该区间内至多 `max_cap` 个精确分数候选上二分出最小
+可行负载率（每次判定为一次最大流可行性检查，评审人容量按
+`floor(负载率 × capacity)` 收紧）；随后把收紧后的容量交给最小费用最大流
+完成第 2、3 级优化。
+
+可行时响应新增 `balance` 字段（未启用或不可行时为 `null`）：
+
+```json
+{
+  "status": "feasible",
+  "total_required": 2,
+  "total_assigned": 2,
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r2"]}
+  ],
+  "unsatisfied": null,
+  "shared_pool": null,
+  "locked_conflicts": null,
+  "bottleneck_cut": null,
+  "balance": {
+    "max_load_ratio": {"numerator": 1, "denominator": 2},
+    "changes": 2
+  }
+}
+```
+
+- `balance.max_load_ratio`：最优最大负载率的**约分分数**（`numerator` 与
+  `denominator` 互质、分母为正；负载率为 0 时表示为 `0/1`）；
+- `balance.changes`：相对 `previous_assignments` 的新增 + 移除关系总数
+  （引用已不存在稿件/评审人的历史关系按移除计，与增量模式语义一致）。
+
+`balance_workload` 可与 `previous_assignments` / `locked_assignments` / 分赛道
+容量任意组合：锁定关系照常强制保留并计入最终负载；无完整可行解时响应与对应
+模式的不可行情形完全一致（`unsatisfied` / `shared_pool` / `bottleneck_cut`
+诊断，`balance` 为 `null`），不输出任何部分分配。
 
 ### 示例调用
 
@@ -464,6 +536,27 @@ curl -s -X POST http://localhost:8000/assign \
           {"id": "r2", "topics": ["ml"], "capacity": 1}
         ]
       }'
+
+# 负载均衡：最小化最大负载率（返回约分分数），再最小化相对上一轮的改动数
+curl -s -X POST http://localhost:8000/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "balance_workload": true,
+        "manuscripts": [
+          {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+          {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["t"], "capacity": 2},
+          {"id": "r2", "topics": ["t"], "capacity": 2}
+        ],
+        "previous_assignments": [
+          {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+          {"manuscript_id": "m2", "reviewer_ids": ["r1"]}
+        ]
+      }'
+# -> assignments 为 m1->r1、m2->r2（接受 1 新增 1 移除，把最大负载率从 1 压到 1/2）；
+#    balance = {"max_load_ratio": {"numerator": 1, "denominator": 2}, "changes": 2}
 ```
 
 ## 算法与确定性
@@ -486,6 +579,14 @@ curl -s -X POST http://localhost:8000/assign \
   `reviewer_capacity` 分类列出的跨割边容量之和即割容量 = `max_assignable`，
   `shortfall` 为总需求与之差。增量模式下该割建在扣除合法锁定占用后的残量网络上，
   `max_assignable` 再加上已固化的锁定名额；锁定校验失败时不给该证明。
+- 负载均衡（`balance_workload`）：完整可行解按字典序优化——先最小化所有
+  `capacity > 0` 评审人最终负载率（`分配数 / capacity`）的最大值，再最小化相对
+  `previous_assignments` 的新增 + 移除总数，同成本解按 ID 破除。负载率全程用
+  约分分数（整数分子/分母）表示与比较，不引入浮点：最优值必为某评审人
+  `最终负载 / capacity` 的分数，故先在 `1/max_cap` 整数网格上二分定位，再在区间内
+  至多 `max_cap` 个精确分数候选中二分（每次判定为一次 Dinic 最大流可行性检查，
+  评审人容量按 `floor(负载率 × capacity)` 收紧），最后用收紧容量下的最小费用
+  最大流完成后两级优化；无完整解时沿用普通 / 增量模式的诊断，不输出部分分配。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -505,7 +606,7 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 app/
   main.py      # FastAPI 入口：/health、/assign
   models.py    # 请求/响应模型与校验
-  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流
+  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化
 tests/
   test_assign.py
 Dockerfile

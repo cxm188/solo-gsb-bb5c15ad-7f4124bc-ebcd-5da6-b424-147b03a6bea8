@@ -84,6 +84,16 @@ class AssignRequest(BaseModel):
             "评审资格或容量约束时，整体判定不可行并返回结构化冲突原因"
         ),
     )
+    balance_workload: bool = Field(
+        default=False,
+        description=(
+            "启用负载均衡优化：完整可行解在资格、赛道、锁定与容量约束下按字典序"
+            "优化——先最小化所有 capacity>0 评审人最终负载率（分配数/capacity）"
+            "的最大值，再最小化相对 previous_assignments 的新增+移除关系总数，"
+            "同成本解按 ID 确定性破除；负载率以约分分数（整数分子/分母）表示与"
+            "比较，不依赖浮点"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_unique_ids(self) -> "AssignRequest":
@@ -183,6 +193,22 @@ class BottleneckCutOut(BaseModel):
     shortfall: int
 
 
+class LoadRatioOut(BaseModel):
+    """约分后的分数（分子 / 分母互质，分母为正）。"""
+
+    numerator: int
+    denominator: int
+
+
+class WorkloadBalanceOut(BaseModel):
+    """balance_workload 启用且可行时的负载均衡结果。"""
+
+    # 所有 capacity>0 评审人最终负载率（分配数/capacity）最大值的约分分数
+    max_load_ratio: LoadRatioOut
+    # 相对 previous_assignments 的新增 + 移除关系总数
+    changes: int
+
+
 class AssignResponse(BaseModel):
     status: Literal["feasible", "infeasible"]
     total_required: int
@@ -196,3 +222,5 @@ class AssignResponse(BaseModel):
     locked_conflicts: list[LockedConflictOut] | None = None
     # 合法但剩余需求无法满足时的全局最小割证明；可行或锁定校验失败时为 null
     bottleneck_cut: BottleneckCutOut | None = None
+    # balance_workload 启用且可行时的负载均衡结果；否则为 null
+    balance: WorkloadBalanceOut | None = None
