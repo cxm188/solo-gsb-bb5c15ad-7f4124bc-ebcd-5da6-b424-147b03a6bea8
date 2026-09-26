@@ -11,20 +11,23 @@ from .models import (
     AssignResponse,
     BottleneckCutEdgeOut,
     BottleneckCutOut,
+    LoadRatioOut,
     LockedConflictOut,
     SharedPoolOut,
     UnsatisfiedOut,
+    WorkloadBalanceOut,
 )
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
     ReviewerSpec,
+    WorkloadBalance,
     solve_assignment,
 )
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -33,7 +36,12 @@ app = FastAPI(
         "赛道限额与总容量在同一流网络中联立求解。"
         "支持增量重排：携带 previous_assignments / locked_assignments 时，"
         "锁定关系经稿件需求、评审资格与容量校验后强制保留，其余名额在全局可行"
-        "前提下最少改动地复用上一轮分配。服务无状态，不持久化任何稿件/评审信息。"
+        "前提下最少改动地复用上一轮分配。"
+        "支持负载均衡：balance_workload 启用后，完整可行解按字典序优化——"
+        "先最小化容量大于 0 的评审人的最大负载率（分配数/容量，整数运算无浮点），"
+        "再最小化相对 previous_assignments 的新增与移除总数，最后按 ID 稳定破同；"
+        "响应返回最优最大负载率的约分分数与改动数。"
+        "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
 
@@ -81,6 +89,16 @@ def _to_bottleneck_cut_out(cut: BottleneckCut) -> BottleneckCutOut:
     )
 
 
+def _to_workload_balance_out(balance: WorkloadBalance) -> WorkloadBalanceOut:
+    return WorkloadBalanceOut(
+        max_load_ratio=LoadRatioOut(
+            numerator=balance.max_load_ratio_num,
+            denominator=balance.max_load_ratio_den,
+        ),
+        changes=balance.changes,
+    )
+
+
 @app.post("/assign", response_model=AssignResponse, tags=["assign"])
 def assign(req: AssignRequest) -> AssignResponse:
     default_required = req.required_reviewers
@@ -119,6 +137,7 @@ def assign(req: AssignRequest) -> AssignResponse:
         reviewers,
         previous=_to_pair_set(req.previous_assignments),
         locked=_to_pair_set(req.locked_assignments),
+        balance=req.balance_workload,
     )
 
     # 锁定关系冲突：结构化原因，不输出任何部分分配
@@ -147,6 +166,11 @@ def assign(req: AssignRequest) -> AssignResponse:
             unsatisfied=None,
             shared_pool=None,
             locked_conflicts=None,
+            workload_balance=(
+                _to_workload_balance_out(result.balance)
+                if result.balance
+                else None
+            ),
         )
 
     return AssignResponse(

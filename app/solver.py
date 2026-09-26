@@ -36,6 +36,22 @@ track 时仍走 稿件->评审人 直边，只受总容量约束。
   为合法锁定名额与割容量之和，证明含锁定关系在内全局至多可满足的名额数；
 - 增广路按 (费用, 节点下标) 字典序选取，节点下标来自 ID 排序：
   同成本解由 ID 顺序确定性地破除，输出完全确定。
+
+负载均衡模式（balance_workload 启用时）在完整可行解中按字典序优化：
+
+- 第一关键字：所有容量 > 0 的评审人的最大负载率（分配数/容量）最小。
+  用参数化最大流二分求解：给定候选比率 p/q，评审人 j 的可接量收紧为
+  min(capacity, floor(p*capacity/q))——load <= floor(p*cap/q) 当且仅当
+  load/cap <= p/q，整数运算即可判定；锁定占用同样计入负载并先行扣减。
+  候选集合为全部 k/capacity 的约分值（最优值必为其中之一），比率比较经
+  fractions.Fraction 的整数交叉相乘完成，全程不依赖浮点数；
+- 第二关键字：相对 previous_assignments 的新增 + 移除总数最小——在按最优
+  负载率收紧后的网络上做最小费用最大流（复用 previous 的边费用 0、新增 1），
+  与增量重排模式同一机制，两者可叠加；
+- 第三关键字：同成本解由 ID 顺序确定性地破除（与增量模式相同的确定性保证）。
+
+不可行时的诊断与不启用负载均衡时完全一致（瓶颈割建在原始容量的网络上），
+不输出任何部分分配。
 """
 
 from __future__ import annotations
@@ -43,6 +59,7 @@ from __future__ import annotations
 import heapq
 from collections import deque
 from dataclasses import dataclass
+from fractions import Fraction
 
 
 @dataclass(frozen=True)
@@ -138,6 +155,21 @@ class BottleneckCut:
 
 
 @dataclass(frozen=True)
+class WorkloadBalance:
+    """负载均衡模式（balance_workload 启用且可行）的最优性结果。
+
+    - max_load_ratio_num / max_load_ratio_den：最优最大负载率的约分分子/分母
+      （整数，比较全程无浮点）；
+    - changes：相对 previous_assignments 的新增 + 移除关系总数
+      （previous 缺省时等于分配关系总数）。
+    """
+
+    max_load_ratio_num: int
+    max_load_ratio_den: int
+    changes: int
+
+
+@dataclass(frozen=True)
 class SolveResult:
     feasible: bool
     # manuscript_id -> 已排序的 reviewer id 元组；不可行时为空（不输出部分结果）
@@ -150,6 +182,8 @@ class SolveResult:
     locked_conflicts: tuple[LockedConflict, ...] = ()
     # 合法但需求无法全部满足时的全局最小割证明；可行或锁定校验失败时为 None
     bottleneck_cut: BottleneckCut | None = None
+    # 负载均衡模式（balance_workload 启用且可行）的最优性结果；否则为 None
+    balance: WorkloadBalance | None = None
 
 
 class _MaxFlow:
@@ -460,23 +494,29 @@ def solve_assignment(
     reviewers: list[ReviewerSpec],
     previous: frozenset[tuple[str, str]] | None = None,
     locked: frozenset[tuple[str, str]] | None = None,
+    balance: bool = False,
 ) -> SolveResult:
     """求解分配。
 
     previous / locked 为 (manuscript_id, reviewer_id) 对集合；两者都缺省时
     走普通模式（行为与历史版本完全一致），任一提供即进入增量重排模式。
+    balance 为 True 时叠加负载均衡：可行解按（最大负载率, 改动数, ID）字典序
+    优化；不可行时返回与不启用时完全一致的诊断结果。
     """
     # 按 ID 排序，保证建图顺序与输入列表顺序无关 -> 输出稳定
     ms = sorted(manuscripts, key=lambda m: m.id)
     rs = sorted(reviewers, key=lambda r: r.id)
     if previous is None and locked is None:
-        return _solve_normal(ms, rs)
-    return _solve_incremental(
-        ms,
-        rs,
-        previous if previous is not None else frozenset(),
-        locked if locked is not None else frozenset(),
-    )
+        base = _solve_normal(ms, rs)
+        if not balance or not base.feasible:
+            return base
+        return _solve_balanced(ms, rs, frozenset(), frozenset())
+    previous_set = previous if previous is not None else frozenset()
+    locked_set = locked if locked is not None else frozenset()
+    base = _solve_incremental(ms, rs, previous_set, locked_set)
+    if not balance or not base.feasible:
+        return base
+    return _solve_balanced(ms, rs, previous_set, locked_set)
 
 
 def _track_node_layout(
@@ -944,4 +984,178 @@ def _solve_incremental(
         unsatisfied=tuple(unsatisfied),
         shared_pool=shared_pool,
         bottleneck_cut=bottleneck_cut,
+    )
+
+
+def _solve_balanced(
+    ms: list[ManuscriptSpec],
+    rs: list[ReviewerSpec],
+    previous: frozenset[tuple[str, str]],
+    locked: frozenset[tuple[str, str]],
+) -> SolveResult:
+    """负载均衡：在完整可行解中按（最大负载率, 改动数, ID）字典序优化。
+
+    前置条件：普通/增量模式已判定可行（锁定关系全部合法），本函数只做重排。
+
+    第一阶段二分最小的可行最大负载率 lambda*：给定候选比率 p/q，评审人 j 的
+    可接量收紧为 min(cap_j, floor(p*cap_j/q))——load <= floor(p*cap_j/q)
+    当且仅当 load/cap <= p/q，整数运算即可判定；再扣除锁定占用后检验剩余
+    网络能否满载。候选集合为全部 k/cap_j 的约分值（最优值必为其中之一），
+    比率比较经 Fraction 的整数交叉相乘完成，全程无浮点。
+
+    第二阶段在按 lambda* 收紧后的网络上做最小费用最大流：复用 previous 的
+    边费用 0、新增边费用 1，即改动数最少；同成本解由 ID 顺序确定性破除。
+    """
+    total_required = sum(m.required_reviewers for m in ms)
+
+    # 可行性预检已保证锁定全部合法；此处重建锁定占用用于负载率收紧
+    locked_map, conflicts = _check_locked(ms, rs, locked)
+    assert not conflicts
+
+    locked_pairs = {(mid, rid) for mid, rids in locked_map.items() for rid in rids}
+    m_by_id = {m.id: m for m in ms}
+    locked_count_r: dict[str, int] = {}
+    locked_track_count_r: dict[str, dict[str, int]] = {}
+    for mid, rid in locked_pairs:
+        locked_count_r[rid] = locked_count_r.get(rid, 0) + 1
+        track = m_by_id[mid].track
+        if track is not None:
+            counts = locked_track_count_r.setdefault(rid, {})
+            counts[track] = counts.get(track, 0) + 1
+
+    m_count, r_count = len(ms), len(rs)
+
+    SRC = 0
+    # 节点布局与其他模式一致：SRC | 稿件 | 评审人 | (评审人, 赛道) 限额节点 | SNK
+    track_nodes, SNK = _track_node_layout(m_count, rs)
+    track_caps = [dict(r.track_capacities) for r in rs]
+
+    def m_node(i: int) -> int:
+        return 1 + i
+
+    def r_node(j: int) -> int:
+        return 1 + m_count + j
+
+    def mr_target(i: int, j: int) -> int:
+        track = ms[i].track
+        if track is not None:
+            node = track_nodes[j].get(track)
+            if node is not None:
+                return node
+        return r_node(j)
+
+    eligible = [_eligible_reviewers(m, rs) for m in ms]
+    remaining_reqs = [
+        m.required_reviewers - len(locked_map.get(m.id, ())) for m in ms
+    ]
+    total_remaining = sum(remaining_reqs)
+
+    def remaining_track_cap(j: int, track: str) -> int:
+        """评审人 j 在赛道 track 上扣除锁定占用后的剩余限额。"""
+        locked_n = locked_track_count_r.get(rs[j].id, {}).get(track, 0)
+        return track_caps[j][track] - locked_n
+
+    def flow_capacity(j: int, ratio: Fraction) -> int:
+        """评审人 j 在负载率上限 ratio 下的剩余可接量（已扣锁定占用）。
+
+        floor(p/q * cap) 用整数运算求取：load <= floor(ratio*cap) 当且仅当
+        load/cap <= ratio，保证负载率比较无浮点误差。
+        """
+        cap = rs[j].capacity
+        cap = min(cap, ratio.numerator * cap // ratio.denominator)
+        return cap - locked_count_r.get(rs[j].id, 0)
+
+    def max_flow_under(ratio: Fraction) -> int:
+        """负载率上限 ratio 下剩余网络的最大流；锁定占用超上限时返回 -1。"""
+        mf = _MaxFlow(SNK + 1)
+        for i in range(m_count):
+            mf.add_edge(SRC, m_node(i), remaining_reqs[i])
+        for i in range(m_count):
+            for j in eligible[i]:
+                if (ms[i].id, rs[j].id) in locked_pairs:
+                    continue  # 锁定对已固化，不再作为候选边
+                mf.add_edge(m_node(i), mr_target(i, j), 1)
+        for j in range(r_count):
+            for track, node in track_nodes[j].items():
+                mf.add_edge(node, r_node(j), remaining_track_cap(j, track))
+        for j in range(r_count):
+            cap = flow_capacity(j, ratio)
+            if cap < 0:
+                return -1  # 锁定占用本身已超出该负载率上限
+            mf.add_edge(r_node(j), SNK, cap)
+        return mf.max_flow(SRC, SNK)
+
+    # ---- 1. 二分最小的可行最大负载率（Fraction 比较为整数交叉相乘，无浮点）----
+    # 最优值必为某评审人的 load/capacity，候选集合取全部 k/cap_j 的约分值
+    candidates = sorted({
+        Fraction(k, cap)
+        for cap in {r.capacity for r in rs if r.capacity > 0}
+        for k in range(cap + 1)
+    })
+    if candidates:
+        # 候选集合必含 1/1：等价于不收紧容量的原始网络，由前置可行性保证可行
+        lo, hi = 0, len(candidates) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if max_flow_under(candidates[mid]) == total_remaining:
+                hi = mid
+            else:
+                lo = mid + 1
+        best_ratio = candidates[lo]
+    else:
+        # 没有任何容量 > 0 的评审人：负载率最大值约定为 0（此时总需求必为 0）
+        best_ratio = Fraction(0, 1)
+
+    # ---- 2. 负载率上限固定为 best_ratio，最小费用最大流求最少改动 ----
+    # 复用 previous 的边费用 0、新增边费用 1：流量固定时费用最小
+    # <=> 复用上一轮的分配最多 <=> 新增 + 移除的关系总数最少。
+    mf = _MinCostMaxFlow(SNK + 1)
+    for i in range(m_count):
+        mf.add_edge(SRC, m_node(i), remaining_reqs[i], 0)
+    mr_edges: list[tuple[int, int, int]] = []  # (稿件下标, 边下标, 评审下标)
+    for i in range(m_count):
+        for j in eligible[i]:
+            if (ms[i].id, rs[j].id) in locked_pairs:
+                continue  # 锁定对已固化，不再作为候选边
+            cost = 0 if (ms[i].id, rs[j].id) in previous else 1
+            ei = mf.add_edge(m_node(i), mr_target(i, j), 1, cost)
+            mr_edges.append((i, ei, j))
+    for j in range(r_count):
+        for track, node in track_nodes[j].items():
+            mf.add_edge(node, r_node(j), remaining_track_cap(j, track), 0)
+    for j in range(r_count):
+        mf.add_edge(r_node(j), SNK, flow_capacity(j, best_ratio), 0)
+    flow, _cost = mf.min_cost_max_flow(SRC, SNK)
+    assert flow == total_remaining  # best_ratio 的可行性已由二分确认
+
+    # 提取分配：锁定对 + 流量对
+    flow_by_m: dict[str, list[str]] = {m.id: [] for m in ms}
+    for i, ei, j in mr_edges:
+        if mf.flow_on(m_node(i), ei) > 0:
+            flow_by_m[ms[i].id].append(rs[j].id)
+    assignment: dict[str, tuple[str, ...]] = {}
+    for m in ms:
+        picked = tuple(sorted(list(locked_map.get(m.id, ())) + flow_by_m[m.id]))
+        assignment[m.id] = picked
+    total_assigned = sum(len(v) for v in assignment.values())
+
+    # 改动数 = 新增 + 移除 = |A| + |P| - 2|A∩P|
+    # （previous 中引用已不存在对象或未被复用的关系均计为移除）
+    final_pairs = {
+        (mid, rid) for mid, rids in assignment.items() for rid in rids
+    }
+    changes = len(final_pairs) + len(previous) - 2 * len(final_pairs & previous)
+
+    return SolveResult(
+        feasible=True,
+        assignments=assignment,
+        total_required=total_required,
+        total_assigned=total_assigned,
+        unsatisfied=(),
+        shared_pool=None,
+        balance=WorkloadBalance(
+            max_load_ratio_num=best_ratio.numerator,
+            max_load_ratio_den=best_ratio.denominator,
+            changes=changes,
+        ),
     )

@@ -1287,3 +1287,541 @@ def test_bottleneck_cut_random_instances_invariants():
     assert checked["normal"] > 0
     assert checked["incremental"] > 0
 
+
+# ---------- 负载均衡模式：balance_workload ----------
+
+def test_balance_disabled_by_default():
+    """默认不启用：无 workload_balance 字段，分配保持原有确定性结果。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2},
+            {"id": "r2", "topics": ["t"], "capacity": 2},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["workload_balance"] is None
+    # 普通模式确定性结果：两篇都给 r1（最大负载率 1，不做均衡）
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r1"]}
+
+
+def test_balance_minimizes_max_load_ratio():
+    """启用后负载被摊开：最大负载率从 1 降到 1/2。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2},
+            {"id": "r2", "topics": ["t"], "capacity": 2},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r2"]}
+    # 未提供 previous：改动数等于分配关系总数
+    assert data["workload_balance"] == {
+        "max_load_ratio": {"numerator": 1, "denominator": 2},
+        "changes": 2,
+    }
+
+
+def test_balance_ratio_is_reduced_fraction():
+    """负载率以约分分数返回：4 稿 2 评审容量 4，负载 (2,2) -> 2/4 约分为 1/2。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": f"m{i}", "authors": [], "topics": ["t"],
+             "required_reviewers": 1}
+            for i in range(4)
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 4},
+            {"id": "r2", "topics": ["t"], "capacity": 4},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assert data["workload_balance"]["max_load_ratio"] == {
+        "numerator": 1, "denominator": 2,
+    }
+    # 每个评审人恰好 2 篇
+    loads = {rid: 0 for rid in ("r1", "r2")}
+    for a in data["assignments"]:
+        loads[a["reviewer_ids"][0]] += 1
+    assert loads == {"r1": 2, "r2": 2}
+
+
+def test_balance_ratio_excludes_zero_capacity_reviewers():
+    """容量为 0 的评审人不参与最大负载率计算。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 0},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["assignments"] == [{"manuscript_id": "m1", "reviewer_ids": ["r1"]}]
+    assert data["workload_balance"]["max_load_ratio"] == {
+        "numerator": 1, "denominator": 1,
+    }
+
+
+def test_balance_empty_manuscripts():
+    """无稿件时负载率约定为 0/1，改动数 0。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [],
+        "reviewers": [{"id": "r1", "topics": [], "capacity": 3}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["workload_balance"] == {
+        "max_load_ratio": {"numerator": 0, "denominator": 1},
+        "changes": 0,
+    }
+
+
+def test_balance_prefers_ratio_over_changes():
+    """字典序：最大负载率优先于改动数。
+
+    previous 把两篇都压给 r1（比率 1，0 改动）；均衡解必须拆到 r1/r2
+    （比率 1/2），即使改动数从 0 变为 2。
+    """
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2},
+            {"id": "r2", "topics": ["t"], "capacity": 2},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+            {"manuscript_id": "m2", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r2"]}
+    # m2->r1 移除 + m2->r2 新增 = 2 处改动
+    assert data["workload_balance"] == {
+        "max_load_ratio": {"numerator": 1, "denominator": 2},
+        "changes": 2,
+    }
+
+
+def test_balance_minimizes_changes_within_optimal_ratio():
+    """previous 已达到最优负载率：必须 0 改动复用，而不是按 ID 默认分配。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2},
+            {"id": "r2", "topics": ["t"], "capacity": 2},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r2"]},
+            {"manuscript_id": "m2", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r2"], "m2": ["r1"]}
+    assert data["workload_balance"] == {
+        "max_load_ratio": {"numerator": 1, "denominator": 2},
+        "changes": 0,
+    }
+
+
+def test_balance_locked_load_counts_toward_ratio():
+    """锁定占用计入负载率：r1 被锁定 1 篇（cap 2），剩余 1 篇应分给 r2。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+            {"id": "m2", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2},
+            {"id": "r2", "topics": ["t"], "capacity": 2},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r2"]}
+    assert data["workload_balance"]["max_load_ratio"] == {
+        "numerator": 1, "denominator": 2,
+    }
+
+
+def test_balance_locked_forces_higher_ratio():
+    """锁定使 r1 满载（2/2）：最优最大负载率只能是 1。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": f"m{i}", "authors": [], "topics": ["t"],
+             "required_reviewers": 1}
+            for i in range(3)
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2},
+            {"id": "r2", "topics": ["t"], "capacity": 2},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m0", "reviewer_ids": ["r1"]},
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m0": ["r1"], "m1": ["r1"], "m2": ["r2"]}
+    assert data["workload_balance"]["max_load_ratio"] == {
+        "numerator": 1, "denominator": 1,
+    }
+
+
+def test_balance_track_capacities_remain_hard_constraints():
+    """赛道限额仍是硬约束：poster 限额 1，两篇 poster 必须分给不同评审人。"""
+    body = {
+        "balance_workload": True,
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "poster"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "poster"},
+            {"id": "m3", "authors": [], "topics": ["t"], "track": "oral"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 3,
+             "track_capacities": {"poster": 1}},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    # r2 容量 1 必被一篇 poster 占满（比率 1），故最优最大负载率为 1
+    assert data["workload_balance"]["max_load_ratio"] == {
+        "numerator": 1, "denominator": 1,
+    }
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r2"], "m2": ["r1"], "m3": ["r1"]}
+
+
+def test_balance_changes_count_unreusable_previous():
+    """previous 中已不合格的关系计为移除，新增计为新增。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["t"],
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1,
+             "conflicted_authors": ["alice"]},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["assignments"] == [{"manuscript_id": "m1", "reviewer_ids": ["r2"]}]
+    # m1->r1 无法复用（移除）+ m1->r2 新增 = 2 处改动
+    assert data["workload_balance"]["changes"] == 2
+
+
+def test_balance_changes_count_unknown_previous_references():
+    """previous 引用已不存在对象的关系计为移除。"""
+    body = {
+        "balance_workload": True,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+        "previous_assignments": [
+            {"manuscript_id": "m9", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["assignments"] == [{"manuscript_id": "m1", "reviewer_ids": ["r1"]}]
+    # (m9,r1) 移除 + (m1,r1) 新增 = 2 处改动
+    assert data["workload_balance"]["changes"] == 2
+
+
+def test_balance_infeasible_diagnostics_unchanged():
+    """无完整解时诊断与不启用时逐字节一致，且不返回部分分配。"""
+    body = {
+        "required_reviewers": 2,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"]},
+            {"id": "m2", "authors": [], "topics": ["t"]},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+    }
+    plain = client.post("/assign", json=body).json()
+    balanced = client.post("/assign", json={**body, "balance_workload": True}).json()
+    assert balanced == plain
+    assert balanced["status"] == "infeasible"
+    assert balanced["assignments"] is None
+    assert balanced["workload_balance"] is None
+    assert balanced["unsatisfied"] is not None
+    assert balanced["bottleneck_cut"] is not None
+
+
+def test_balance_locked_conflict_unchanged():
+    """锁定冲突时与不启用时逐字节一致：只返回 locked_conflicts。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["ml"], "required_reviewers": 1},
+        ],
+        "reviewers": [{"id": "r2", "topics": ["db"], "capacity": 1}],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r2"]},
+        ],
+    }
+    plain = client.post("/assign", json=body).json()
+    balanced = client.post("/assign", json={**body, "balance_workload": True}).json()
+    assert balanced == plain
+    assert balanced["status"] == "infeasible"
+    assert balanced["locked_conflicts"][0]["type"] == "topic_mismatch"
+    assert balanced["workload_balance"] is None
+
+
+def test_balance_deterministic_and_order_independent():
+    """相同输入（含列表乱序）产生完全相同的均衡结果。"""
+    body = _random_instance(seed=13)  # 该种子生成的实例可行
+    body["balance_workload"] = True
+    r1 = client.post("/assign", json=body).json()
+    assert r1["status"] == "feasible"
+    _verify_constraints(body, r1)
+    assert r1["workload_balance"] is not None
+    r2 = client.post("/assign", json=body).json()
+    assert r1 == r2
+    shuffled = {
+        **body,
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+    }
+    r3 = client.post("/assign", json=shuffled).json()
+    assert r3 == r1
+
+
+def test_balance_ratio_matches_actual_loads():
+    """随机可行实例：返回的负载率必须等于实际负载率的最大值（整数交叉验证）。"""
+    for seed in (5, 11, 23, 42):
+        body = _random_instance(seed=seed)
+        body["balance_workload"] = True
+        data = client.post("/assign", json=body).json()
+        if data["status"] != "feasible":
+            continue
+        _verify_constraints(body, data)
+        reviewers = {r["id"]: r for r in body["reviewers"]}
+        loads = {rid: 0 for rid in reviewers}
+        for a in data["assignments"]:
+            for rid in a["reviewer_ids"]:
+                loads[rid] += 1
+        ratio = data["workload_balance"]["max_load_ratio"]
+        # 实际最大负载率（整数交叉相乘，无浮点）必须等于返回值
+        for rid, load in loads.items():
+            cap = reviewers[rid]["capacity"]
+            if cap > 0:
+                assert load * ratio["denominator"] <= ratio["numerator"] * cap
+        assert any(
+            cap > 0
+            and load * ratio["denominator"] == ratio["numerator"] * cap
+            for rid, load in loads.items()
+            for cap in (reviewers[rid]["capacity"],)
+        ) or not any(reviewers[r]["capacity"] > 0 for r in reviewers)
+
+
+def test_balance_matches_brute_force_optimum():
+    """小实例暴力枚举对拍：(最优最大负载率, 最少改动数) 必须与枚举结果一致。"""
+    import itertools
+    from fractions import Fraction
+
+    def eligible_ids(m, reviewers):
+        out = []
+        for r in reviewers:
+            if r["id"] in m["authors"]:
+                continue
+            if set(m["authors"]) & set(r.get("conflicted_authors", [])):
+                continue
+            if m["topics"] and not set(m["topics"]) & set(r["topics"]):
+                continue
+            out.append(r["id"])
+        return out
+
+    def brute_force(body):
+        reviewers = {r["id"]: r for r in body["reviewers"]}
+        default_req = body.get("required_reviewers", 1)
+        prev = {
+            (p["manuscript_id"], rid)
+            for p in body.get("previous_assignments") or []
+            for rid in set(p["reviewer_ids"])
+        }
+        locked = {
+            (p["manuscript_id"], rid)
+            for p in body.get("locked_assignments") or []
+            for rid in set(p["reviewer_ids"])
+        }
+        locked_by_m, locked_by_r = {}, {}
+        for mid, rid in locked:
+            m = next((x for x in body["manuscripts"] if x["id"] == mid), None)
+            r = reviewers.get(rid)
+            if m is None or r is None or rid not in eligible_ids(m, body["reviewers"]):
+                return None
+            locked_by_m.setdefault(mid, set()).add(rid)
+            locked_by_r.setdefault(rid, set()).add(mid)
+        for rid, ms_ in locked_by_r.items():
+            if len(ms_) > reviewers[rid]["capacity"]:
+                return None
+        best = None
+        choices = []
+        for m in body["manuscripts"]:
+            req = m.get("required_reviewers") or default_req
+            lk = locked_by_m.get(m["id"], set())
+            pool = [rid for rid in eligible_ids(m, body["reviewers"]) if rid not in lk]
+            need = req - len(lk)
+            if need < 0:
+                return None
+            choices.append(
+                [set(lk) | set(c) for c in itertools.combinations(pool, need)]
+            )
+        for combo in itertools.product(*choices):
+            loads = {rid: 0 for rid in reviewers}
+            track_loads = {rid: {} for rid in reviewers}
+            pairs = set()
+            ok = True
+            for m, rids in zip(body["manuscripts"], combo):
+                track = m.get("track")
+                for rid in rids:
+                    loads[rid] += 1
+                    pairs.add((m["id"], rid))
+                    if track is not None:
+                        per = track_loads[rid]
+                        per[track] = per.get(track, 0) + 1
+            for rid, n in loads.items():
+                if n > reviewers[rid]["capacity"]:
+                    ok = False
+            for rid, per in track_loads.items():
+                caps = reviewers[rid].get("track_capacities") or {}
+                for t, n in per.items():
+                    if t in caps and n > caps[t]:
+                        ok = False
+            if not ok:
+                continue
+            ratio = max(
+                (Fraction(n, reviewers[rid]["capacity"])
+                 for rid, n in loads.items() if reviewers[rid]["capacity"] > 0),
+                default=Fraction(0),
+            )
+            changes = len(pairs) + len(prev) - 2 * len(pairs & prev)
+            key = (ratio, changes)
+            if best is None or key < best:
+                best = key
+        return best
+
+    n_feasible = 0
+    for seed in range(60):
+        sub = random.Random(seed)
+        topics = ["ml", "nlp", "cv"]
+        authors = [f"a{i}" for i in range(5)]
+        body = {
+            "balance_workload": True,
+            "required_reviewers": sub.choice([1, 2]),
+            "manuscripts": [
+                {
+                    "id": f"m{i}",
+                    "authors": sub.sample(authors, sub.randint(0, 1)),
+                    "topics": sub.sample(topics, sub.randint(1, 2)),
+                    "required_reviewers": sub.randint(1, 2),
+                    **({"track": sub.choice(["A", "B"])}
+                       if sub.random() < 0.4 else {}),
+                }
+                for i in range(sub.randint(1, 3))
+            ],
+            "reviewers": [
+                {
+                    "id": f"r{j}",
+                    "topics": sub.sample(topics, sub.randint(1, 2)),
+                    "capacity": sub.randint(0, 3),
+                    "conflicted_authors": sub.sample(authors, sub.randint(0, 1)),
+                    **({"track_capacities": {
+                        t: sub.randint(0, 2) for t in sub.sample(["A", "B"], 1)
+                    }} if sub.random() < 0.4 else {}),
+                }
+                for j in range(sub.randint(1, 4))
+            ],
+        }
+        rids_all = [r["id"] for r in body["reviewers"]]
+        if sub.random() < 0.5:
+            prev = [
+                {"manuscript_id": m["id"],
+                 "reviewer_ids": sub.sample(rids_all, min(len(rids_all), 2))}
+                for m in body["manuscripts"] if sub.random() < 0.6
+            ]
+            if prev:
+                body["previous_assignments"] = prev
+        if sub.random() < 0.3:
+            locks = [
+                {"manuscript_id": m["id"], "reviewer_ids": [sub.choice(rids_all)]}
+                for m in body["manuscripts"] if sub.random() < 0.4
+            ]
+            if locks:
+                body["locked_assignments"] = locks
+
+        data = client.post("/assign", json=body).json()
+        bf = brute_force(body)
+        if bf is None:
+            assert data["status"] == "infeasible"
+            assert data["assignments"] is None
+            assert data["workload_balance"] is None
+            continue
+        assert data["status"] == "feasible"
+        _verify_constraints(body, data)
+        wb = data["workload_balance"]
+        got = (
+            Fraction(wb["max_load_ratio"]["numerator"],
+                     wb["max_load_ratio"]["denominator"]),
+            wb["changes"],
+        )
+        assert got == bf
+        n_feasible += 1
+    assert n_feasible > 0
+
